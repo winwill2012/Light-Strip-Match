@@ -39,6 +39,9 @@
 *.out
 *.app
 
+# PlatformIO
+.pio/
+
 # Build directories
 build/
 Build/
