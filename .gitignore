@@ -41,6 +41,8 @@
 
 # PlatformIO
 .pio/
+src/game_sounds.h
+src/game_sounds.cpp
 
 # Build directories
 build/

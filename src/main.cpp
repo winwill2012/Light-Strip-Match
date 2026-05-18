@@ -4,6 +4,7 @@
 #include <FastLED.h>
 #include <U8g2lib.h>
 
+#include "game_audio.h"
 #include "game_config.h"
 #include "wifi_portal.h"
 
@@ -11,7 +12,7 @@
 static constexpr int PIN_WS2812 = 2;
 static constexpr int PIN_I2C_SDA = 1;
 static constexpr int PIN_I2C_SCL = 0;
-static constexpr int PIN_BUZZER = 5;
+// MAX98357 I2S：BCLK=GPIO6, LRC=GPIO7, DIN=GPIO3（见 game_audio.cpp）
 static constexpr int PIN_BTN_RED = 20;
 static constexpr int PIN_BTN_GREEN = 10;
 static constexpr int PIN_BTN_BLUE = 9;
@@ -104,101 +105,6 @@ static void initDebounced(DebouncedPin &p) {
   p.down = p.prevRaw;
   p.changed = false;
   p.rawChangeMs = millis();
-}
-
-static void buzzerScore() {
-  tone(PIN_BUZZER, 1568, 70);
-}
-
-// 发射子弹（短促「嗖」感，三色略区分音高）
-static void buzzerFire(const uint8_t color) {
-  uint16_t f = 1050;
-  switch (color) {
-    case 1:
-      f = 920;
-      break;
-    case 2:
-      f = 1180;
-      break;
-    case 3:
-      f = 1420;
-      break;
-    default:
-      break;
-  }
-  tone(PIN_BUZZER, f, 28);
-}
-
-static void buzzerUi() {
-  tone(PIN_BUZZER, 523, 55);
-}
-
-// 非阻塞蜂鸣：升级约 2s（紧张短句）、失败约 5s
-struct BuzzerSeq {
-  enum Kind : uint8_t { None = 0, Upgrade = 1, GameOver = 2 } kind = None;
-  uint32_t t0 = 0;
-  int16_t lastSeg = -1;
-};
-static BuzzerSeq g_buz;
-
-static void buzzerSeqStop() {
-  noTone(PIN_BUZZER);
-  g_buz.kind = BuzzerSeq::None;
-  g_buz.lastSeg = -1;
-}
-
-static void buzzerSeqStartUpgrade(const uint32_t now) {
-  if (g_buz.kind == BuzzerSeq::GameOver) {
-    return;
-  }
-  noTone(PIN_BUZZER);
-  g_buz.kind = BuzzerSeq::Upgrade;
-  g_buz.t0 = now;
-  g_buz.lastSeg = -1;
-}
-
-static void buzzerSeqStartGameOver(const uint32_t now) {
-  noTone(PIN_BUZZER);
-  g_buz.kind = BuzzerSeq::GameOver;
-  g_buz.t0 = now;
-  g_buz.lastSeg = -1;
-}
-
-static void buzzerSeqTick(const uint32_t now) {
-  if (g_buz.kind == BuzzerSeq::None) {
-    return;
-  }
-  const uint32_t dt = now - g_buz.t0;
-  if (g_buz.kind == BuzzerSeq::Upgrade) {
-    if (dt >= 2000) {
-      buzzerSeqStop();
-      return;
-    }
-    // 紧张感：快速高低交替 + 随时间抬升的低音（类似警报）
-    constexpr uint32_t kStepMs = 65;
-    const int seg = static_cast<int>(dt / kStepMs);
-    if (seg != g_buz.lastSeg) {
-      g_buz.lastSeg = static_cast<int16_t>(seg);
-      const bool hi = (seg & 1) != 0;
-      const unsigned lowHz = 220 + static_cast<unsigned>(dt / 35);
-      const unsigned highHz = 880 + static_cast<unsigned>((dt / 50) % 180);
-      tone(PIN_BUZZER, hi ? highHz : lowHz, static_cast<unsigned>(kStepMs + 30));
-    }
-    return;
-  }
-  if (g_buz.kind == BuzzerSeq::GameOver) {
-    if (dt >= 5000) {
-      buzzerSeqStop();
-      return;
-    }
-    constexpr uint32_t kStepMs = 200;
-    const int seg = static_cast<int>(dt / kStepMs);
-    if (seg != g_buz.lastSeg) {
-      g_buz.lastSeg = static_cast<int16_t>(seg);
-      const int hz = 400 - seg * 14;
-      tone(PIN_BUZZER, static_cast<unsigned>(hz > 90 ? hz : 90), static_cast<unsigned>(kStepMs + 30));
-    }
-  }
 }
 
 static void tickDebounced(DebouncedPin &p, const uint32_t now) {
@@ -369,11 +275,11 @@ static void tryTierUp(const uint32_t now) {
   if (g_nextSpawnMs > now + g_spawnIntervalMs) {
     g_nextSpawnMs = now + g_spawnIntervalMs;
   }
-  buzzerSeqStartUpgrade(now);
+  gameAudioSeqStartUpgrade(now);
 }
 
 static void resetGameCore(const uint32_t now) {
-  buzzerSeqStop();
+  gameAudioSeqStop();
   syncLedCountFromConfig();
   memset(g_play, 0, sizeof(g_play));
   fillQueueRandom();
@@ -411,7 +317,7 @@ static void beginStartFlash(const uint32_t now) {
       pr.end();
     }
   }
-  buzzerUi();
+  gameAudioBegin();
 }
 
 static void tickStartFlash(const uint32_t now) {
@@ -461,7 +367,7 @@ static void triggerGameOver(const uint32_t now) {
     return;
   }
   g_gameOver = true;
-  buzzerSeqStartGameOver(now);
+  gameAudioSeqStartGameOver(now);
 }
 
 // 同色：子弹与灯珠一起消失并得分；异色：立即失败
@@ -476,7 +382,7 @@ static void resolveBulletIntoGemCell(Bullet &bul, const int8_t cellRow, const ui
     bul.active = false;
     startExplosion(cellRow, gcol, now);
     g_score += g_speedLevel;
-    buzzerScore();
+    gameAudioScore();
     if (g_score > g_highScore) {
       g_highScore = g_score;
       Preferences pr;
@@ -528,7 +434,7 @@ static bool trySpawnBullet(uint8_t color) {
       g_bullets[i].active = true;
       g_bullets[i].row = bottom;
       g_bullets[i].color = color;
-      buzzerFire(color);
+      gameAudioFire(color);
       return true;
     }
   }
@@ -637,7 +543,7 @@ static void handleGameButton(const uint32_t now) {
       g_gameLongDone = true;
       resetGameCore(now);
       g_screen = GameScreen::Splash;
-      buzzerUi();
+      gameAudioUi();
     }
     g_gameWasDown = true;
     return;
@@ -950,8 +856,7 @@ void setup() {
   initDebounced(g_dBlue);
   initDebounced(g_dGame);
 
-  pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
+  gameAudioInit();
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(400000);
@@ -1032,5 +937,5 @@ void loop() {
   sceneToLeds(now);
   FastLED.show();
   drawOled(now);
-  buzzerSeqTick(now);
+  gameAudioTick(now);
 }
