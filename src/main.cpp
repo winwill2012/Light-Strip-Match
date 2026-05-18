@@ -4,6 +4,9 @@
 #include <FastLED.h>
 #include <U8g2lib.h>
 
+#include "game_config.h"
+#include "wifi_portal.h"
+
 // ===================== 引脚（ESP32-C3 Super Mini）=====================
 static constexpr int PIN_WS2812 = 2;
 static constexpr int PIN_I2C_SDA = 1;
@@ -15,24 +18,35 @@ static constexpr int PIN_BTN_BLUE = 9;
 static constexpr int PIN_BTN_GAME = 8;
 
 // ===================== 灯带布局 =====================
-static constexpr uint16_t kNumLeds = 30;
+static constexpr uint16_t kMaxLeds = 64;
 static constexpr uint16_t kQueueLen = 3;
-static constexpr uint16_t kPlayLen = kNumLeds - kQueueLen;
+static uint16_t g_numLeds = 30;
+
+static inline uint16_t playLen() {
+  return (g_numLeds > kQueueLen) ? (g_numLeds - kQueueLen) : 1;
+}
+
+static void syncLedCountFromConfig() {
+  g_numLeds = gameConfigLedCount();
+}
 
 static constexpr uint32_t kTierUpIntervalMs = 30000;
 static constexpr uint8_t kMaxDifficulty = 5;
+static constexpr uint32_t kExplosionDurMs = 320;
+static constexpr int kMaxExplosions = 4;
 
 static constexpr uint8_t kPreviewBrightness = 110;
 static constexpr uint8_t kPlayBrightness = 255;
 
 static uint8_t g_queue[kQueueLen];
-static uint8_t g_play[kPlayLen];
-static CRGB g_leds[kNumLeds];
+static uint8_t g_play[kMaxLeds - kQueueLen];
+static CRGB g_leds[kMaxLeds];
 
 static uint32_t g_gravityIntervalMs = 333;
 static uint32_t g_spawnIntervalMs = 3000;
 static uint32_t g_nextSpawnMs = 0;
 static uint32_t g_nextGravityMs = 0;
+static uint32_t g_nextBulletMs = 0;
 static uint32_t g_nextSpeedupMs = 0;
 
 static uint32_t g_score = 0;
@@ -50,11 +64,23 @@ struct Bullet {
 };
 static Bullet g_bullets[kMaxBullets];
 
+struct Explosion {
+  int8_t playRow;
+  uint8_t color;
+  uint32_t startMs;
+  bool active;
+};
+static Explosion g_explosions[kMaxExplosions];
+
 // ===================== OLED（SSD1306 128x64 I2C）=====================
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C g_u8g2(U8G2_R0, U8X8_PIN_NONE);
 
-enum class GameScreen : uint8_t { Splash, Playing };
+enum class GameScreen : uint8_t { Splash, StartFlash, Playing };
 static GameScreen g_screen = GameScreen::Splash;
+
+static constexpr uint32_t kStartFlashStepMs = 130;
+static constexpr int kStartFlashSteps = 6; // 红→绿→蓝 各闪 2 轮
+static uint32_t g_startFlashT0 = 0;
 
 // ===================== 按键去抖（低电平按下）=====================
 static constexpr uint32_t kDebounceMs = 35;
@@ -208,15 +234,40 @@ static CRGB crgbFromId(uint8_t id, uint8_t scale) {
 }
 
 static CRGB cellLedColor(uint16_t pi) {
-  if (g_play[pi] != 0) {
+  if (pi < playLen() && g_play[pi] != 0) {
     return crgbFromId(g_play[pi], kPlayBrightness);
   }
   return CRGB::Black;
 }
 
+// 若前两颗同色，则不再生成同色（避免连续三颗同色）
+static uint8_t randomColorNoTriple(const uint8_t prev1, const uint8_t prev2) {
+  uint8_t c = static_cast<uint8_t>(random(1, 4));
+  if (prev1 >= 1 && prev1 <= 3 && prev1 == prev2) {
+    while (c == prev1) {
+      c = static_cast<uint8_t>(random(1, 4));
+    }
+  }
+  return c;
+}
+
 static void fillQueueRandom() {
-  for (uint16_t i = 0; i < kQueueLen; ++i) {
-    g_queue[i] = static_cast<uint8_t>(random(1, 4));
+  g_queue[0] = randomColorNoTriple(0, 0);
+  g_queue[1] = randomColorNoTriple(g_queue[0], 0);
+  g_queue[2] = randomColorNoTriple(g_queue[1], g_queue[0]);
+}
+
+// 即将落入 play[0] 时，避免与 play[1]、play[2] 纵向连成三同色
+static void fixQueueHeadBeforeSpawn() {
+  if (g_play[0] != 0 || g_queue[0] < 1) {
+    return;
+  }
+  if (playLen() >= 3 && g_play[1] != 0 && g_play[1] == g_play[2] && g_play[2] == g_queue[0]) {
+    uint8_t c = 0;
+    do {
+      c = randomColorNoTriple(g_play[2], g_play[1]);
+    } while (c == g_queue[0]);
+    g_queue[0] = c;
   }
 }
 
@@ -226,17 +277,80 @@ static void clearBullets() {
   }
 }
 
-// 等级 1..5：生成间隔、重力间隔（每秒 N 格 ≈ 1000/N ms）
-static constexpr uint32_t kSpawnIntervalByLevel[kMaxDifficulty] = {3000, 2500, 2000, 1500, 1000};
-static constexpr uint32_t kGravityIntervalByLevel[kMaxDifficulty] = {333, 333, 333, 250, 250};
+static void clearExplosions() {
+  for (int i = 0; i < kMaxExplosions; ++i) {
+    g_explosions[i].active = false;
+  }
+}
+
+static uint16_t playIndexToPhys(const int8_t playPi) {
+  const uint16_t row = static_cast<uint16_t>(kQueueLen + static_cast<uint16_t>(playPi));
+  return g_numLeds - 1 - row;
+}
+
+static void startExplosion(const int8_t playRow, const uint8_t color, const uint32_t now) {
+  for (int i = 0; i < kMaxExplosions; ++i) {
+    if (!g_explosions[i].active) {
+      g_explosions[i].playRow = playRow;
+      g_explosions[i].color = color;
+      g_explosions[i].startMs = now;
+      g_explosions[i].active = true;
+      return;
+    }
+  }
+  g_explosions[0].playRow = playRow;
+  g_explosions[0].color = color;
+  g_explosions[0].startMs = now;
+  g_explosions[0].active = true;
+}
+
+static void drawExplosionOverlay(const Explosion &ex, const uint32_t now) {
+  const uint32_t dt = now - ex.startMs;
+  if (dt >= kExplosionDurMs) {
+    return;
+  }
+  const uint8_t fade = static_cast<uint8_t>(255 - (dt * 255UL) / kExplosionDurMs);
+  int spread = 1 + static_cast<int>(dt / 70);
+  if (spread > 3) {
+    spread = 3;
+  }
+  for (int d = -spread; d <= spread; ++d) {
+    const int pi = static_cast<int>(ex.playRow) + d;
+    if (pi < 0 || pi >= static_cast<int>(playLen())) {
+      continue;
+    }
+    const uint16_t phys = playIndexToPhys(static_cast<int8_t>(pi));
+    const int ad = d < 0 ? -d : d;
+    uint8_t br = fade;
+    if (ad > 0) {
+      br = scale8(fade, static_cast<uint8_t>(240 - ad * 55));
+    }
+    CRGB c = crgbFromId(ex.color, br);
+    if (ad == 0 && dt < 80) {
+      const uint8_t flash = static_cast<uint8_t>(255 - (dt * 255UL) / 80);
+      c = CRGB::White;
+      c.nscale8(flash);
+    }
+    g_leds[phys] += c;
+  }
+}
+
+static void applyExplosionsToLeds(const uint32_t now) {
+  for (int i = 0; i < kMaxExplosions; ++i) {
+    if (!g_explosions[i].active) {
+      continue;
+    }
+    if (now - g_explosions[i].startMs >= kExplosionDurMs) {
+      g_explosions[i].active = false;
+      continue;
+    }
+    drawExplosionOverlay(g_explosions[i], now);
+  }
+}
 
 static void applyDifficultyFromLevel() {
-  const uint8_t idx =
-      (g_speedLevel < 1) ? 0
-                         : (g_speedLevel > kMaxDifficulty ? static_cast<uint8_t>(kMaxDifficulty - 1)
-                                                          : static_cast<uint8_t>(g_speedLevel - 1));
-  g_spawnIntervalMs = kSpawnIntervalByLevel[idx];
-  g_gravityIntervalMs = kGravityIntervalByLevel[idx];
+  g_spawnIntervalMs = gameConfigSpawnForLevel(g_speedLevel);
+  g_gravityIntervalMs = gameConfigGravityForLevel(g_speedLevel);
 }
 
 static void tryTierUp(const uint32_t now) {
@@ -260,20 +374,61 @@ static void tryTierUp(const uint32_t now) {
 
 static void resetGameCore(const uint32_t now) {
   buzzerSeqStop();
+  syncLedCountFromConfig();
   memset(g_play, 0, sizeof(g_play));
   fillQueueRandom();
   clearBullets();
+  clearExplosions();
   g_speedLevel = 1;
   applyDifficultyFromLevel();
   g_score = 0;
   g_gameOver = false;
   g_nextSpawnMs = now + g_spawnIntervalMs;
   g_nextGravityMs = now + g_gravityIntervalMs;
+  g_nextBulletMs = now + gameConfigBulletStepMs();
   g_nextSpeedupMs = now + kTierUpIntervalMs;
 }
 
+static void trySpawn();
+
+static void beginPlayingTimers(const uint32_t now) {
+  // 勿用 now：同帧内会先 trySpawn 再重力，play[0] 空出后会立刻二次生成
+  g_nextGravityMs = now + g_gravityIntervalMs;
+  g_nextSpawnMs = now + g_spawnIntervalMs;
+  g_nextBulletMs = now + gameConfigBulletStepMs();
+  g_nextSpeedupMs = now + kTierUpIntervalMs;
+}
+
+static void beginStartFlash(const uint32_t now) {
+  resetGameCore(now);
+  g_startFlashT0 = now;
+  g_screen = GameScreen::StartFlash;
+  g_showSplashTips = false;
+  {
+    Preferences pr;
+    if (pr.begin("lsmatch", false)) {
+      pr.putBool("tip", true);
+      pr.end();
+    }
+  }
+  buzzerUi();
+}
+
+static void tickStartFlash(const uint32_t now) {
+  if (g_screen != GameScreen::StartFlash) {
+    return;
+  }
+  const uint32_t elapsed = now - g_startFlashT0;
+  if (elapsed < kStartFlashStepMs * static_cast<uint32_t>(kStartFlashSteps)) {
+    return;
+  }
+  g_screen = GameScreen::Playing;
+  beginPlayingTimers(now);
+  trySpawn();
+}
+
 static void applyGravityOnce() {
-  for (int i = static_cast<int>(kPlayLen) - 2; i >= 0; --i) {
+  for (int i = static_cast<int>(playLen()) - 2; i >= 0; --i) {
     if (g_play[i] != 0 && g_play[i + 1] == 0) {
       g_play[i + 1] = g_play[i];
       g_play[i] = 0;
@@ -285,10 +440,11 @@ static void trySpawn() {
   if (g_play[0] != 0) {
     return;
   }
+  fixQueueHeadBeforeSpawn();
   g_play[0] = g_queue[0];
   g_queue[0] = g_queue[1];
   g_queue[1] = g_queue[2];
-  g_queue[2] = static_cast<uint8_t>(random(1, 4));
+  g_queue[2] = randomColorNoTriple(g_queue[1], g_queue[0]);
 }
 
 static bool cellHasFlyingBullet(int8_t row) {
@@ -310,7 +466,7 @@ static void triggerGameOver(const uint32_t now) {
 
 // 同色：子弹与灯珠一起消失并得分；异色：立即失败
 static void resolveBulletIntoGemCell(Bullet &bul, const int8_t cellRow, const uint32_t now) {
-  if (cellRow < 0 || cellRow >= static_cast<int8_t>(kPlayLen) || g_play[cellRow] == 0) {
+  if (cellRow < 0 || cellRow >= static_cast<int8_t>(playLen()) || g_play[cellRow] == 0) {
     return;
   }
   const uint8_t gcol = g_play[cellRow];
@@ -318,6 +474,7 @@ static void resolveBulletIntoGemCell(Bullet &bul, const int8_t cellRow, const ui
   if (bcol == gcol) {
     g_play[cellRow] = 0;
     bul.active = false;
+    startExplosion(cellRow, gcol, now);
     g_score += g_speedLevel;
     buzzerScore();
     if (g_score > g_highScore) {
@@ -362,7 +519,7 @@ static void stepBullet(Bullet &bul, const int bi, const uint32_t now) {
 }
 
 static bool trySpawnBullet(uint8_t color) {
-  const int8_t bottom = static_cast<int8_t>(kPlayLen - 1);
+  const int8_t bottom = static_cast<int8_t>(playLen() - 1);
   if (cellHasFlyingBullet(bottom)) {
     return false;
   }
@@ -401,14 +558,32 @@ static void moveBulletsOnce(const uint32_t now) {
   }
 }
 
-static void sceneToLeds() {
-  if (g_gameOver) {
-    const bool on = ((millis() / 350) & 1U) != 0;
-    fill_solid(g_leds, kNumLeds, on ? CRGB::Red : CRGB::Black);
+static void sceneToLeds(const uint32_t now) {
+  if (g_screen == GameScreen::StartFlash) {
+    const uint32_t elapsed = now - g_startFlashT0;
+    const int step = static_cast<int>(elapsed / kStartFlashStepMs) % 3;
+    CRGB c = CRGB::Black;
+    switch (step) {
+      case 0:
+        c = CRGB::Red;
+        break;
+      case 1:
+        c = CRGB::Green;
+        break;
+      default:
+        c = CRGB::Blue;
+        break;
+    }
+    fill_solid(g_leds, g_numLeds, c);
     return;
   }
-  for (uint16_t row = 0; row < kNumLeds; ++row) {
-    const uint16_t phys = kNumLeds - 1 - row;
+  if (g_gameOver) {
+    const bool on = ((millis() / 350) & 1U) != 0;
+    fill_solid(g_leds, g_numLeds, on ? CRGB::Red : CRGB::Black);
+    return;
+  }
+  for (uint16_t row = 0; row < g_numLeds; ++row) {
+    const uint16_t phys = g_numLeds - 1 - row;
     if (row < kQueueLen) {
       const uint16_t qi = kQueueLen - 1 - row;
       g_leds[phys] = crgbFromId(g_queue[qi], kPreviewBrightness);
@@ -422,11 +597,11 @@ static void sceneToLeds() {
       continue;
     }
     const int8_t br = g_bullets[i].row;
-    if (br < 0 || br >= static_cast<int8_t>(kPlayLen)) {
+    if (br < 0 || br >= static_cast<int8_t>(playLen())) {
       continue;
     }
     const uint16_t row = static_cast<uint16_t>(kQueueLen + static_cast<uint16_t>(br));
-    const uint16_t phys = kNumLeds - 1 - row;
+    const uint16_t phys = g_numLeds - 1 - row;
     switch (g_bullets[i].color) {
       case 1:
         g_leds[phys] = CRGB::Red;
@@ -440,6 +615,10 @@ static void sceneToLeds() {
       default:
         break;
     }
+  }
+  applyExplosionsToLeds(now);
+  for (uint16_t i = g_numLeds; i < kMaxLeds; ++i) {
+    g_leds[i] = CRGB::Black;
   }
 }
 
@@ -469,17 +648,7 @@ static void handleGameButton(const uint32_t now) {
       if (g_gameOver) {
         // 失败态仅允许长按复位
       } else if (g_screen == GameScreen::Splash) {
-        g_screen = GameScreen::Playing;
-        resetGameCore(now);
-        g_showSplashTips = false;
-        {
-          Preferences pr;
-          if (pr.begin("lsmatch", false)) {
-            pr.putBool("tip", true);
-            pr.end();
-          }
-        }
-        buzzerUi();
+        beginStartFlash(now);
       }
     }
     g_gameWasDown = false;
@@ -553,6 +722,64 @@ static void drawUtf8Centered(const uint8_t *font, int baselineY, const char *utf
   g_u8g2.drawUTF8((128 - w) / 2, baselineY, utf8);
 }
 
+static void drawSplashScreen(const uint32_t now) {
+  drawOledOuterFrameAndDot(now, true);
+
+  for (int i = 0; i < 8; ++i) {
+    if (((now / 90 + i) & 3U) == 0U) {
+      continue;
+    }
+    const int px = 6 + static_cast<int>((now / 35 + i * 29) % 116);
+    const int py = 6 + static_cast<int>((now / 47 + i * 17) % 52);
+    g_u8g2.drawPixel(px, py);
+  }
+
+  const char *title = "灯带消消乐";
+  g_u8g2.setFont(u8g2_font_wqy16_t_gb2312a);
+  const int titleW = g_u8g2.getUTF8Width(title);
+  const int titleX = (128 - titleW) / 2;
+  const int bob = static_cast<int>((now / 200) % 3) - 1;
+  const int titleY = 21 + bob;
+  g_u8g2.drawUTF8(titleX, titleY, title);
+  const int underlineY = titleY + 5;
+  g_u8g2.drawHLine(titleX, underlineY, titleW);
+
+  const int scanW = 6;
+  const int scanX = titleX + static_cast<int>((now / 22) % (titleW + scanW)) - scanW / 2;
+  if (scanX >= titleX - 2 && scanX + scanW <= titleX + titleW + 2) {
+    g_u8g2.setDrawColor(2);
+    g_u8g2.drawBox(scanX, titleY - 15, scanW, 17);
+    g_u8g2.setDrawColor(1);
+  }
+
+  constexpr int kBarX = 20;
+  constexpr int kBarY = 34;
+  constexpr int kBarW = 88;
+  constexpr int kBarH = 5;
+  g_u8g2.drawFrame(kBarX, kBarY, kBarW, kBarH);
+  const int segW = 14;
+  const int segX = kBarX + 1 + static_cast<int>((now / 45) % (kBarW - segW - 2));
+  g_u8g2.drawBox(segX, kBarY + 1, segW, kBarH - 2);
+
+  g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
+  if (g_showSplashTips) {
+    const bool blink = ((now / 480) & 1U) != 0;
+    if (blink) {
+      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 48, "短按游戏键：开始");
+    }
+    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 58, "长按游戏键：重新开始");
+    if (wifiPortalApRunning()) {
+      char apHint[24];
+      snprintf(apHint, sizeof(apHint), "热点:%s", wifiPortalApSsid());
+      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 62, apHint);
+    } else {
+      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 62, "WiFi未就绪");
+    }
+  } else {
+    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 50, "按游戏键开始");
+  }
+}
+
 static void drawBottomFourKeyHints() {
   const int y0 = 48;
   const int h = 14;
@@ -586,70 +813,7 @@ static void drawBottomFourKeyHints() {
   }
 }
 
-static void drawPlayingHudExtras(const uint32_t now) {
-  // 细进度条：距下次升级（满级时条内呼吸）
-  constexpr int kBarX = 2;
-  constexpr int kBarY = 43;
-  constexpr int kBarW = 124;
-  constexpr int kBarH = 4;
-  int innerFill = 0;
-  if (g_speedLevel >= kMaxDifficulty) {
-    innerFill = ((now / 240) & 1U) != 0 ? (kBarW - 4) : (kBarW - 24);
-  } else if (g_nextSpeedupMs > now) {
-    const uint32_t rem = g_nextSpeedupMs - now;
-    innerFill = static_cast<int>((static_cast<uint64_t>(kBarW - 4) * (kTierUpIntervalMs - rem)) / kTierUpIntervalMs);
-  } else {
-    innerFill = kBarW - 4;
-  }
-  if (innerFill > kBarW - 4) {
-    innerFill = kBarW - 4;
-  }
-  g_u8g2.setDrawColor(1);
-  g_u8g2.drawFrame(kBarX, kBarY, kBarW, kBarH);
-  if (innerFill > 0) {
-    g_u8g2.drawBox(kBarX + 1, kBarY + 1, innerFill, kBarH - 2);
-  }
-  // 顶区下方流星点（不与大号得分区重叠）
-  for (int s = 0; s < 5; ++s) {
-    const int px = 3 + static_cast<int>((now / (48 + s * 11) + s * 23) % 122);
-    const int py = 27;
-    g_u8g2.drawPixel(px, py);
-  }
-}
-
-static void drawOled(const uint32_t now) {
-  const bool chaseBorderDot = (g_screen == GameScreen::Playing && !g_gameOver);
-  const uint32_t minPeriod = chaseBorderDot ? 33u : 80u;
-  if ((now - g_lastDrawMs) < minPeriod) {
-    return;
-  }
-  g_lastDrawMs = now;
-  g_u8g2.clearBuffer();
-  g_u8g2.setFontMode(1);
-
-  if (g_screen == GameScreen::Splash) {
-    g_u8g2.setDrawColor(1);
-    drawOledOuterFrameAndDot(now, false);
-    const char *title = "灯带消消乐";
-    g_u8g2.setFont(u8g2_font_wqy16_t_gb2312a);
-    const int titleW = g_u8g2.getUTF8Width(title);
-    const int titleX = (128 - titleW) / 2;
-    constexpr int kTitleBaseline = 24;
-    g_u8g2.drawUTF8(titleX, kTitleBaseline, title);
-    const int underlineY = kTitleBaseline + 5;
-    g_u8g2.drawHLine(titleX, underlineY, titleW);
-    g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
-    if (g_showSplashTips) {
-      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 38, "短按游戏键：开始");
-      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 50, "长按游戏键：重新开始");
-      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 62, "红绿蓝键：发射子弹");
-    } else {
-      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 46, "按游戏键开始");
-    }
-    g_u8g2.sendBuffer();
-    return;
-  }
-
+static void drawTopHudBar() {
   g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
   g_u8g2.drawUTF8(2, 12, "得分");
   const int wScoreLbl = g_u8g2.getUTF8Width("得分");
@@ -677,25 +841,95 @@ static void drawOled(const uint32_t now) {
       g_u8g2.drawUTF8(lvX, 12, lvTxt);
     }
   }
+}
+
+static void drawBigScoreCentered(const char *asciiScore, const int baselineY) {
+  g_u8g2.setFont(u8g2_font_logisoso26_tf);
+  int w = g_u8g2.getStrWidth(asciiScore);
+  if (w > 120) {
+    g_u8g2.setFont(u8g2_font_logisoso22_tf);
+    w = g_u8g2.getStrWidth(asciiScore);
+  }
+  if (w > 120) {
+    g_u8g2.setFont(u8g2_font_logisoso20_tf);
+    w = g_u8g2.getStrWidth(asciiScore);
+  }
+  g_u8g2.drawStr((128 - w) / 2, baselineY, asciiScore);
+}
+
+static void drawPlayingHudExtras(const uint32_t now) {
+  // 细进度条：距下次升级（满级时条内呼吸）
+  constexpr int kBarX = 2;
+  constexpr int kBarY = 43;
+  constexpr int kBarW = 124;
+  constexpr int kBarH = 4;
+  int innerFill = 0;
+  if (g_speedLevel >= kMaxDifficulty) {
+    innerFill = ((now / 240) & 1U) != 0 ? (kBarW - 4) : (kBarW - 24);
+  } else if (g_nextSpeedupMs > now) {
+    const uint32_t rem = g_nextSpeedupMs - now;
+    innerFill = static_cast<int>((static_cast<uint64_t>(kBarW - 4) * (kTierUpIntervalMs - rem)) / kTierUpIntervalMs);
+  } else {
+    innerFill = kBarW - 4;
+  }
+  if (innerFill > kBarW - 4) {
+    innerFill = kBarW - 4;
+  }
+  g_u8g2.setDrawColor(1);
+  g_u8g2.drawFrame(kBarX, kBarY, kBarW, kBarH);
+  if (innerFill > 0) {
+    g_u8g2.drawBox(kBarX + 1, kBarY + 1, innerFill, kBarH - 2);
+  }
+}
+
+static void drawOled(const uint32_t now) {
+  const bool chaseBorderDot =
+      ((g_screen == GameScreen::Playing || g_screen == GameScreen::StartFlash) && !g_gameOver);
+  uint32_t minPeriod = 80u;
+  if (g_screen == GameScreen::Splash) {
+    minPeriod = 40u;
+  } else if (g_gameOver) {
+    minPeriod = 50u;
+  } else if (chaseBorderDot) {
+    minPeriod = 33u;
+  }
+  if ((now - g_lastDrawMs) < minPeriod) {
+    return;
+  }
+  g_lastDrawMs = now;
+  g_u8g2.clearBuffer();
+  g_u8g2.setFontMode(1);
+
+  if (g_screen == GameScreen::Splash) {
+    g_u8g2.setDrawColor(1);
+    drawSplashScreen(now);
+    g_u8g2.sendBuffer();
+    return;
+  }
+
+  // 失败态：整屏每秒闪烁（亮 0.5s / 灭 0.5s），不再显示「游戏结束」
+  if (g_gameOver && ((now / 500) & 1U) != 0U) {
+    g_u8g2.sendBuffer();
+    return;
+  }
+
+  drawTopHudBar();
 
   char buf[16];
   snprintf(buf, sizeof(buf), "%lu", static_cast<unsigned long>(g_score));
 
   if (g_gameOver) {
-    // 结束态：得分上移略缩小，提示放在中下部；不画底部四格以免与说明抢空间
-    g_u8g2.setFont(u8g2_font_logisoso24_tf);
-    const int swGo = g_u8g2.getStrWidth(buf);
-    g_u8g2.drawStr((128 - swGo) / 2, 32, buf);
+    drawBigScoreCentered(buf, 44);
     g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
-    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 48, "游戏结束");
     drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 60, "长按游戏键重开");
+  } else if (g_screen == GameScreen::StartFlash) {
+    g_u8g2.setFont(u8g2_font_wqy16_t_gb2312a);
+    drawUtf8Centered(u8g2_font_wqy16_t_gb2312a, 38, "准备");
   } else {
     if (g_screen == GameScreen::Playing) {
       drawPlayingHudExtras(now);
     }
-    g_u8g2.setFont(u8g2_font_logisoso26_tf);
-    const int sw = g_u8g2.getStrWidth(buf);
-    g_u8g2.drawStr((128 - sw) / 2, 40, buf);
+    drawBigScoreCentered(buf, 44);
     drawBottomFourKeyHints();
   }
   drawOledOuterFrameAndDot(now, chaseBorderDot);
@@ -704,7 +938,7 @@ static void drawOled(const uint32_t now) {
 
 void setup() {
   Serial.begin(115200);
-  delay(150);
+  delay(400);
 
   pinMode(PIN_BTN_RED, INPUT_PULLUP);
   pinMode(PIN_BTN_GREEN, INPUT_PULLUP);
@@ -725,9 +959,11 @@ void setup() {
 
   randomSeed(esp_random());
 
-  FastLED.addLeds<WS2812, PIN_WS2812, GRB>(g_leds, kNumLeds);
+  gameConfigLoad();
+
+  syncLedCountFromConfig();
+  FastLED.addLeds<WS2812, PIN_WS2812, GRB>(g_leds, kMaxLeds);
   FastLED.setBrightness(40);
-  FastLED.clear(true);
 
   const uint32_t now = millis();
   {
@@ -744,30 +980,47 @@ void setup() {
   memset(g_play, 0, sizeof(g_play));
   fillQueueRandom();
   clearBullets();
+  clearExplosions();
   g_speedLevel = 1;
   applyDifficultyFromLevel();
   g_score = 0;
   g_nextSpawnMs = now + g_spawnIntervalMs;
   g_nextGravityMs = now + g_gravityIntervalMs;
+  g_nextBulletMs = now + gameConfigBulletStepMs();
   g_nextSpeedupMs = now + kTierUpIntervalMs;
   g_screen = GameScreen::Splash;
+
+  // WiFi 放在外设初始化之后；C3 Super Mini 对初始化顺序与发射功率敏感
+  wifiPortalBegin();
+  if (wifiPortalApRunning()) {
+    fill_solid(g_leds, g_numLeds, CRGB::Green);
+  } else {
+    fill_solid(g_leds, g_numLeds, CRGB::Red);
+  }
+  FastLED.show();
+  delay(300);
+  FastLED.clear(true);
 }
 
 void loop() {
   const uint32_t now = millis();
 
+  wifiPortalLoop();
   handleGameButton(now);
+  tickStartFlash(now);
   handleFireButtons(now);
 
   if (g_screen == GameScreen::Playing && !g_gameOver) {
     tryTierUp(now);
+    if (now >= g_nextBulletMs) {
+      g_nextBulletMs = now + gameConfigBulletStepMs();
+      moveBulletsOnce(now);
+    }
     if (now >= g_nextGravityMs) {
       g_nextGravityMs = now + g_gravityIntervalMs;
       applyGravityOnce();
-      if (g_play[kPlayLen - 1] != 0) {
+      if (g_play[playLen() - 1] != 0) {
         triggerGameOver(now);
-      } else {
-        moveBulletsOnce(now);
       }
     }
     if (now >= g_nextSpawnMs) {
@@ -776,7 +1029,7 @@ void loop() {
     }
   }
 
-  sceneToLeds();
+  sceneToLeds(now);
   FastLED.show();
   drawOled(now);
   buzzerSeqTick(now);
