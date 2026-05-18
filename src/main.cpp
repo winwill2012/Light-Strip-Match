@@ -52,6 +52,8 @@ static uint32_t g_nextSpeedupMs = 0;
 
 static uint32_t g_score = 0;
 static uint32_t g_highScore = 0;
+static volatile bool g_hiScorePending = false;
+static uint32_t g_hiScorePendingVal = 0;
 static uint16_t g_speedLevel = 1;
 static bool g_gameOver = false;
 static bool g_showSplashTips = true;
@@ -241,6 +243,15 @@ static void drawExplosionOverlay(const Explosion &ex, const uint32_t now) {
   }
 }
 
+static bool hasActiveExplosion() {
+  for (int i = 0; i < kMaxExplosions; ++i) {
+    if (g_explosions[i].active) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void applyExplosionsToLeds(const uint32_t now) {
   for (int i = 0; i < kMaxExplosions; ++i) {
     if (!g_explosions[i].active) {
@@ -251,6 +262,18 @@ static void applyExplosionsToLeds(const uint32_t now) {
       continue;
     }
     drawExplosionOverlay(g_explosions[i], now);
+  }
+}
+
+static void flushPendingHighScore() {
+  if (!g_hiScorePending) {
+    return;
+  }
+  g_hiScorePending = false;
+  Preferences pr;
+  if (pr.begin("lsmatch", false)) {
+    pr.putULong("hi", g_hiScorePendingVal);
+    pr.end();
   }
 }
 
@@ -385,11 +408,8 @@ static void resolveBulletIntoGemCell(Bullet &bul, const int8_t cellRow, const ui
     gameAudioScore();
     if (g_score > g_highScore) {
       g_highScore = g_score;
-      Preferences pr;
-      if (pr.begin("lsmatch", false)) {
-        pr.putULong("hi", g_highScore);
-        pr.end();
-      }
+      g_hiScorePendingVal = g_highScore;
+      g_hiScorePending = true;
     }
     return;
   }
@@ -424,7 +444,7 @@ static void stepBullet(Bullet &bul, const int bi, const uint32_t now) {
   bul.row = nr;
 }
 
-static bool trySpawnBullet(uint8_t color) {
+static bool trySpawnBullet(uint8_t color, const uint32_t now) {
   const int8_t bottom = static_cast<int8_t>(playLen() - 1);
   if (cellHasFlyingBullet(bottom)) {
     return false;
@@ -435,6 +455,7 @@ static bool trySpawnBullet(uint8_t color) {
       g_bullets[i].row = bottom;
       g_bullets[i].color = color;
       gameAudioFire(color);
+      g_nextBulletMs = now + gameConfigBulletStepMs();
       return true;
     }
   }
@@ -561,21 +582,26 @@ static void handleGameButton(const uint32_t now) {
   }
 }
 
+static uint8_t g_firePrevRaw = 0;
+
 static void handleFireButtons(const uint32_t now) {
   if (g_screen != GameScreen::Playing || g_gameOver) {
+    g_firePrevRaw = 0;
     return;
   }
-  tickDebounced(g_dRed, now);
-  tickDebounced(g_dGreen, now);
-  tickDebounced(g_dBlue, now);
-  if (g_dRed.changed && g_dRed.down) {
-    trySpawnBullet(1);
+  const uint8_t raw = static_cast<uint8_t>(
+      (digitalRead(PIN_BTN_RED) == LOW ? 1u : 0u) | (digitalRead(PIN_BTN_GREEN) == LOW ? 2u : 0u) |
+      (digitalRead(PIN_BTN_BLUE) == LOW ? 4u : 0u));
+  const uint8_t pressed = raw & static_cast<uint8_t>(~g_firePrevRaw);
+  g_firePrevRaw = raw;
+  if (pressed & 1u) {
+    trySpawnBullet(1, now);
   }
-  if (g_dGreen.changed && g_dGreen.down) {
-    trySpawnBullet(2);
+  if (pressed & 2u) {
+    trySpawnBullet(2, now);
   }
-  if (g_dBlue.changed && g_dBlue.down) {
-    trySpawnBullet(3);
+  if (pressed & 4u) {
+    trySpawnBullet(3, now);
   }
 }
 
@@ -796,8 +822,10 @@ static void drawOled(const uint32_t now) {
     minPeriod = 40u;
   } else if (g_gameOver) {
     minPeriod = 50u;
+  } else if (hasActiveExplosion()) {
+    minPeriod = 120u;
   } else if (chaseBorderDot) {
-    minPeriod = 33u;
+    minPeriod = 50u;
   }
   if ((now - g_lastDrawMs) < minPeriod) {
     return;
@@ -910,10 +938,10 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
+  handleFireButtons(now);
   wifiPortalLoop();
   handleGameButton(now);
   tickStartFlash(now);
-  handleFireButtons(now);
 
   if (g_screen == GameScreen::Playing && !g_gameOver) {
     tryTierUp(now);
@@ -936,6 +964,9 @@ void loop() {
 
   sceneToLeds(now);
   FastLED.show();
-  drawOled(now);
+  if (!hasActiveExplosion() || (now - g_lastDrawMs) >= 80u) {
+    drawOled(now);
+  }
+  flushPendingHighScore();
   gameAudioTick(now);
 }

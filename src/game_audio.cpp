@@ -4,6 +4,7 @@
 
 #include "driver/i2s.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "game_sounds.h"
 
@@ -14,15 +15,12 @@ static constexpr int PIN_I2S_DIN = 3;
 
 static constexpr uint32_t kSampleRate = 44100;
 static constexpr size_t kChunkSamples = 512;
-static constexpr float kSfxGain = 1.48f;
-static constexpr float kUiGain = 1.15f;
-static constexpr float kTrebleAmt = 0.42f;
-static constexpr int kPrimeChunks = 6;
-
+static constexpr float kSfxGain = 1.0f;
+static constexpr float kUiGain = 0.55f;
 static int16_t g_pcm[kChunkSamples];
-static int16_t g_prevMono = 0;
 static bool g_i2sOk = false;
 static TaskHandle_t g_audioTask = nullptr;
+static SemaphoreHandle_t g_audioMx = nullptr;
 
 enum class SoundPri : uint8_t { Sfx = 1, Upgrade = 2, GameOver = 3 };
 
@@ -32,7 +30,7 @@ struct Playback {
   size_t totalBytes = 0;
   SoundPri priority = SoundPri::Sfx;
   float gain = 1.0f;
-  volatile bool active = false;
+  bool active = false;
 };
 static Playback g_play;
 
@@ -46,59 +44,65 @@ static int16_t softLimit(const int32_t v) {
   return static_cast<int16_t>(v);
 }
 
-static int16_t softCompress(const int32_t v) {
-  constexpr int32_t kThresh = 26000;
-  if (v > kThresh) {
-    return static_cast<int16_t>(kThresh + ((v - kThresh) * 3) / 8);
+static void applyGainStereo(int16_t *samples, const size_t sampleCount, const float gain) {
+  if (gain >= 0.999f) {
+    return;
   }
-  if (v < -kThresh) {
-    return static_cast<int16_t>(-kThresh + ((v + kThresh) * 3) / 8);
-  }
-  return static_cast<int16_t>(v);
-}
-
-static void resetFxState() {
-  g_prevMono = 0;
-}
-
-static void processChunk(int16_t *samples, const size_t count, const float gain) {
-  for (size_t i = 0; i + 1 < count; i += 2) {
-    const int32_t mono = (static_cast<int32_t>(samples[i]) + static_cast<int32_t>(samples[i + 1])) / 2;
-    const int32_t bright = mono + static_cast<int32_t>(static_cast<float>(mono - g_prevMono) * kTrebleAmt);
-    g_prevMono = static_cast<int16_t>(mono);
-
-    int32_t out = static_cast<int32_t>(static_cast<float>(bright) * gain);
-    out = softCompress(out);
-    out = softLimit(out);
-    const int16_t s = static_cast<int16_t>(out);
-    samples[i] = s;
-    samples[i + 1] = s;
+  for (size_t i = 0; i < sampleCount; ++i) {
+    const int32_t scaled = static_cast<int32_t>(static_cast<float>(samples[i]) * gain);
+    samples[i] = softLimit(scaled);
   }
 }
 
-static void stopPlayback() {
+static bool writePcmToI2s(const uint8_t *data, const size_t bytes) {
+  size_t sent = 0;
+  while (sent < bytes) {
+    size_t written = 0;
+    const esp_err_t err =
+        i2s_write(I2S_NUM_0, data + sent, bytes - sent, &written, portMAX_DELAY);
+    if (err != ESP_OK || written == 0) {
+      return false;
+    }
+    sent += written;
+  }
+  return true;
+}
+
+static void stopPlaybackLocked() {
   g_play.active = false;
   g_play.data = nullptr;
   g_play.posBytes = 0;
   g_play.totalBytes = 0;
-  resetFxState();
 }
 
-static bool canReplace(const SoundPri incoming) {
+static bool canReplaceLocked(const SoundPri incoming) {
   if (!g_play.active) {
+    return true;
+  }
+  if (incoming == SoundPri::Sfx && g_play.priority == SoundPri::Sfx) {
     return true;
   }
   return static_cast<uint8_t>(incoming) >= static_cast<uint8_t>(g_play.priority);
 }
 
 static bool pumpOneChunk() {
-  if (!g_i2sOk || !g_play.active || g_play.data == nullptr) {
+  if (!g_i2sOk) {
+    return false;
+  }
+
+  if (xSemaphoreTake(g_audioMx, pdMS_TO_TICKS(5)) != pdTRUE) {
+    return g_play.active;
+  }
+
+  if (!g_play.active || g_play.data == nullptr) {
+    xSemaphoreGive(g_audioMx);
     return false;
   }
 
   const size_t remain = g_play.totalBytes - g_play.posBytes;
   if (remain == 0) {
-    stopPlayback();
+    stopPlaybackLocked();
+    xSemaphoreGive(g_audioMx);
     return false;
   }
 
@@ -106,32 +110,29 @@ static bool pumpOneChunk() {
   if (srcBytes > kChunkSamples * sizeof(int16_t)) {
     srcBytes = kChunkSamples * sizeof(int16_t);
   }
-  const size_t srcSamples = srcBytes / sizeof(int16_t);
 
   memcpy_P(g_pcm, g_play.data + g_play.posBytes, srcBytes);
-  processChunk(g_pcm, srcSamples, g_play.gain);
+  applyGainStereo(g_pcm, srcBytes / sizeof(int16_t), g_play.gain);
 
-  size_t written = 0;
-  i2s_write(I2S_NUM_0, g_pcm, srcBytes, &written, portMAX_DELAY);
+  xSemaphoreGive(g_audioMx);
+
+  if (!writePcmToI2s(reinterpret_cast<const uint8_t *>(g_pcm), srcBytes)) {
+    return g_play.active;
+  }
+
+  if (xSemaphoreTake(g_audioMx, pdMS_TO_TICKS(5)) != pdTRUE) {
+    return g_play.active;
+  }
   g_play.posBytes += srcBytes;
-
   if (g_play.posBytes >= g_play.totalBytes) {
-    stopPlayback();
-    return false;
+    stopPlaybackLocked();
   }
-  return true;
-}
-
-static void primePlayback() {
-  for (int i = 0; i < kPrimeChunks; ++i) {
-    if (!pumpOneChunk()) {
-      break;
-    }
-  }
+  xSemaphoreGive(g_audioMx);
+  return g_play.active;
 }
 
 static void audioTask(void * /*arg*/) {
-  constexpr int kMaxChunksPerWake = 24;
+  constexpr int kMaxChunksPerWake = 32;
   for (;;) {
     if (g_play.active) {
       for (int n = 0; n < kMaxChunksPerWake && g_play.active; ++n) {
@@ -139,7 +140,7 @@ static void audioTask(void * /*arg*/) {
           break;
         }
       }
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
     } else {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
     }
@@ -147,26 +148,38 @@ static void audioTask(void * /*arg*/) {
 }
 
 static void startSound(const GameSound &snd, const SoundPri pri, const float gain) {
-  if (!g_i2sOk || snd.bytes == 0) {
+  if (!g_i2sOk || snd.bytes == 0 || g_audioMx == nullptr) {
     return;
   }
-  if (!canReplace(pri)) {
+
+  if (xSemaphoreTake(g_audioMx, pdMS_TO_TICKS(20)) != pdTRUE) {
     return;
   }
-  resetFxState();
+
+  if (!canReplaceLocked(pri)) {
+    xSemaphoreGive(g_audioMx);
+    return;
+  }
+
   g_play.data = snd.data;
   g_play.posBytes = 0;
   g_play.totalBytes = snd.bytes;
   g_play.priority = pri;
   g_play.gain = gain;
   g_play.active = true;
-  primePlayback();
+  xSemaphoreGive(g_audioMx);
+
   if (g_audioTask != nullptr) {
     xTaskNotifyGive(g_audioTask);
   }
 }
 
 void gameAudioInit() {
+  g_audioMx = xSemaphoreCreateMutex();
+  if (g_audioMx == nullptr) {
+    return;
+  }
+
   i2s_config_t cfg = {};
   cfg.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX);
   cfg.sample_rate = kSampleRate;
@@ -174,9 +187,9 @@ void gameAudioInit() {
   cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  cfg.dma_buf_count = 8;
+  cfg.dma_buf_count = 10;
   cfg.dma_buf_len = 512;
-  cfg.use_apll = true;
+  cfg.use_apll = false;
   cfg.tx_desc_auto_clear = true;
 
   i2s_pin_config_t pins = {};
@@ -192,14 +205,12 @@ void gameAudioInit() {
   if (g_i2sOk) {
     i2s_zero_dma_buffer(I2S_NUM_0);
     i2s_set_sample_rates(I2S_NUM_0, kSampleRate);
-    xTaskCreate(audioTask, "audio", 3072, nullptr, 5, &g_audioTask);
+    xTaskCreate(audioTask, "audio", 4096, nullptr, 6, &g_audioTask);
   }
 }
 
 void gameAudioTick(const uint32_t /*nowMs*/) {
-  if (g_play.active && g_audioTask != nullptr) {
-    xTaskNotifyGive(g_audioTask);
-  }
+  // 音频由独立任务喂 DMA，主循环不再重复唤醒
 }
 
 void gameAudioScore() {
@@ -230,5 +241,11 @@ void gameAudioSeqStartGameOver(const uint32_t /*nowMs*/) {
 }
 
 void gameAudioSeqStop() {
-  stopPlayback();
+  if (g_audioMx == nullptr) {
+    return;
+  }
+  if (xSemaphoreTake(g_audioMx, pdMS_TO_TICKS(20)) == pdTRUE) {
+    stopPlaybackLocked();
+    xSemaphoreGive(g_audioMx);
+  }
 }
