@@ -5,7 +5,7 @@
 static GameConfig g_cfg;
 static bool g_cfgLoaded = false;
 
-static const uint32_t kDefaultSpawn[kGameConfigLevels] = {2000, 1800, 1500, 1200, 1000};
+static const uint32_t kDefaultSpawn[kGameConfigLevels] = {1800, 1600, 1400, 1200, 1000};
 static const uint32_t kDefaultGravity[kGameConfigLevels] = {300, 275, 250, 200, 175};
 static constexpr uint32_t kDefaultBullet = 15;
 static constexpr uint16_t kDefaultLedCount = 30;
