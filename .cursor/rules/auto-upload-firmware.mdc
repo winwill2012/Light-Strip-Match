@@ -1,0 +1,11 @@
+---
+description: 修改固件源码后自动编译并上传到 ESP32-C3
+alwaysApply: true
+---
+
+修改本项目固件相关文件后，**无需用户再次提醒**，在回复前执行上传：
+
+- 涉及路径：`src/`、`platformio.ini`、`tools/pio_embed_wav.py`、`tools/embed_wav.py`
+- 命令（项目根目录）：`pio run -t upload`
+- 仅改文档、3D 模型、README 等无关固件的内容时不必上传
+- 上传失败时说明原因并尝试修复，不要静默跳过

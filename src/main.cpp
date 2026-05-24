@@ -17,6 +17,17 @@ static constexpr int PIN_BTN_RED = 20;
 static constexpr int PIN_BTN_GREEN = 10;
 static constexpr int PIN_BTN_BLUE = 9;
 static constexpr int PIN_BTN_GAME = 8;
+static constexpr int PIN_BAT_ADC = 4; // 两路 10K 分压，V_adc = V_bat / 2
+
+static constexpr int kBatFullMv = 4200;       // 3.7V 锂电满电
+static constexpr int kBatEmptyMv = 3300;      // 显示 0% 的电压
+static constexpr int kBatDividerNum = 200;    // 分压比 ×100（10K+10K → ×2）
+static constexpr int kBatDividerDen = 100;
+static constexpr int kBatAdcCorrectNum = 135; // ESP32-C3 ADC 在 ~2V 附近常偏低
+static constexpr int kBatAdcCorrectDen = 100;
+static constexpr uint32_t kBatSampleMs = 800;
+static uint32_t g_batSampleMs = 0;
+static uint8_t g_batPercent = 0;
 
 // ===================== 灯带布局 =====================
 static constexpr uint16_t kMaxLeds = 64;
@@ -607,65 +618,84 @@ static void handleFireButtons(const uint32_t now) {
 
 static uint32_t g_lastDrawMs = 0;
 
-// 128×64 外边框路径长度（顺时针，与 drawFrame(0,0,128,64) 重合）
-static constexpr int kBorderPathLen = 379;
-
-static void borderPathIndexToXY(int idx, int &x, int &y) {
-  idx %= kBorderPathLen;
-  if (idx < 128) {
-    x = idx;
-    y = 0;
-    return;
-  }
-  idx -= 128;
-  if (idx < 62) {
-    x = 127;
-    y = 1 + idx;
-    return;
-  }
-  idx -= 62;
-  if (idx < 127) {
-    x = 126 - idx;
-    y = 63;
-    return;
-  }
-  idx -= 127;
-  x = 0;
-  y = 62 - idx;
-}
-
-static void drawOledOuterFrameAndDot(const uint32_t now, const bool chaseDot) {
-  g_u8g2.setDrawColor(1);
-  g_u8g2.drawFrame(0, 0, 128, 64);
-  if (chaseDot) {
-    int bx = 0;
-    int by = 0;
-    borderPathIndexToXY(static_cast<int>((now / 28) % kBorderPathLen), bx, by);
-    // 与 1px 白边框同色时普通绘制不可见；用 XOR 在边框上形成移动的「缺口」
-    g_u8g2.setDrawColor(2);
-    g_u8g2.drawDisc(bx, by, 2);
-    g_u8g2.setDrawColor(1);
-  }
-}
-
 static void drawUtf8Centered(const uint8_t *font, int baselineY, const char *utf8) {
   g_u8g2.setFont(font);
   const int w = g_u8g2.getUTF8Width(utf8);
   g_u8g2.drawUTF8((128 - w) / 2, baselineY, utf8);
 }
 
-static void drawSplashScreen(const uint32_t now) {
-  drawOledOuterFrameAndDot(now, true);
-
-  for (int i = 0; i < 8; ++i) {
-    if (((now / 90 + i) & 3U) == 0U) {
-      continue;
+static void sampleBattery(const uint32_t now) {
+  if ((now - g_batSampleMs) < kBatSampleMs) {
+    return;
+  }
+  g_batSampleMs = now;
+  int samples[12];
+  for (int i = 0; i < 12; ++i) {
+    samples[i] = analogReadMilliVolts(PIN_BAT_ADC);
+    delayMicroseconds(200);
+  }
+  for (int i = 0; i < 11; ++i) {
+    for (int j = i + 1; j < 12; ++j) {
+      if (samples[j] < samples[i]) {
+        const int t = samples[i];
+        samples[i] = samples[j];
+        samples[j] = t;
+      }
     }
-    const int px = 6 + static_cast<int>((now / 35 + i * 29) % 116);
-    const int py = 6 + static_cast<int>((now / 47 + i * 17) % 52);
-    g_u8g2.drawPixel(px, py);
+  }
+  int pinMv = 0;
+  for (int i = 3; i < 9; ++i) {
+    pinMv += samples[i];
+  }
+  pinMv /= 6;
+  const int batMv =
+      (pinMv * kBatDividerNum * kBatAdcCorrectNum) / (kBatDividerDen * kBatAdcCorrectDen);
+  int pct = 0;
+  if (batMv >= kBatFullMv) {
+    pct = 100;
+  } else if (batMv <= kBatEmptyMv) {
+    pct = 0;
+  } else {
+    pct = (batMv - kBatEmptyMv) * 100 / (kBatFullMv - kBatEmptyMv);
+  }
+  g_batPercent = static_cast<uint8_t>(pct);
+}
+
+static void drawBatteryIcon(const int x, const int y, const uint8_t percent) {
+  constexpr int kBodyW = 16;
+  constexpr int kBodyH = 8;
+  g_u8g2.drawFrame(x, y, kBodyW, kBodyH);
+  g_u8g2.drawBox(x + kBodyW, y + 2, 2, 4);
+  const int innerW = kBodyW - 4;
+  const int fillW = (innerW * static_cast<int>(percent) + 50) / 100;
+  if (fillW > 0) {
+    g_u8g2.drawBox(x + 2, y + 2, fillW, kBodyH - 4);
+  }
+}
+
+static void drawTopStatusBar(const bool showLevel, const bool showHistory) {
+  g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
+
+  if (showHistory) {
+    char hist[20];
+    snprintf(hist, sizeof(hist), "历史%lu", static_cast<unsigned long>(g_highScore));
+    g_u8g2.drawUTF8(2, 12, hist);
   }
 
+  constexpr int kBatBodyW = 16;
+  constexpr int kBatTipW = 2;
+  const int kBatX = 126 - kBatBodyW - kBatTipW;
+  drawBatteryIcon(kBatX, 2, g_batPercent);
+
+  if (showLevel) {
+    char lvTxt[12];
+    snprintf(lvTxt, sizeof(lvTxt), "%u级", static_cast<unsigned>(g_speedLevel));
+    const int lvW = g_u8g2.getUTF8Width(lvTxt);
+    g_u8g2.drawUTF8((128 - lvW) / 2, 12, lvTxt);
+  }
+}
+
+static void drawSplashScreen(const uint32_t now) {
   const char *title = "灯带消消乐";
   g_u8g2.setFont(u8g2_font_wqy16_t_gb2312a);
   const int titleW = g_u8g2.getUTF8Width(title);
@@ -676,14 +706,6 @@ static void drawSplashScreen(const uint32_t now) {
   const int underlineY = titleY + 5;
   g_u8g2.drawHLine(titleX, underlineY, titleW);
 
-  const int scanW = 6;
-  const int scanX = titleX + static_cast<int>((now / 22) % (titleW + scanW)) - scanW / 2;
-  if (scanX >= titleX - 2 && scanX + scanW <= titleX + titleW + 2) {
-    g_u8g2.setDrawColor(2);
-    g_u8g2.drawBox(scanX, titleY - 15, scanW, 17);
-    g_u8g2.setDrawColor(1);
-  }
-
   constexpr int kBarX = 20;
   constexpr int kBarY = 34;
   constexpr int kBarW = 88;
@@ -693,13 +715,14 @@ static void drawSplashScreen(const uint32_t now) {
   const int segX = kBarX + 1 + static_cast<int>((now / 45) % (kBarW - segW - 2));
   g_u8g2.drawBox(segX, kBarY + 1, segW, kBarH - 2);
 
-  g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
+  drawTopStatusBar(false, false);
+
   if (g_showSplashTips) {
     const bool blink = ((now / 480) & 1U) != 0;
     if (blink) {
-      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 48, "短按游戏键：开始");
+      drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 52, "短按游戏键：开始");
     }
-    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 58, "长按游戏键：重新开始");
+    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 60, "长按游戏键：重新开始");
     if (wifiPortalApRunning()) {
       char apHint[24];
       snprintf(apHint, sizeof(apHint), "热点:%s", wifiPortalApSsid());
@@ -708,70 +731,7 @@ static void drawSplashScreen(const uint32_t now) {
       drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 62, "WiFi未就绪");
     }
   } else {
-    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 50, "按游戏键开始");
-  }
-}
-
-static void drawBottomFourKeyHints() {
-  const int y0 = 48;
-  const int h = 14;
-  const int x0 = 1;
-  const int widths[4] = {32, 32, 31, 31};
-  int x = x0;
-  g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
-  for (int i = 0; i < 4; ++i) {
-    const int w = widths[i];
-    g_u8g2.drawFrame(x, y0, w, h);
-    const char *label = nullptr;
-    switch (i) {
-      case 0:
-        label = "红";
-        break;
-      case 1:
-        label = "绿";
-        break;
-      case 2:
-        label = "蓝";
-        break;
-      default:
-        label = "\xe2\x86\x91";
-        break;
-    }
-    const int tw = g_u8g2.getUTF8Width(label);
-    const int tx = x + (w - tw) / 2;
-    const int ty = y0 + 12;
-    g_u8g2.drawUTF8(tx, ty, label);
-    x += w;
-  }
-}
-
-static void drawTopHudBar() {
-  g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
-  g_u8g2.drawUTF8(2, 12, "得分");
-  const int wScoreLbl = g_u8g2.getUTF8Width("得分");
-
-  char hist[20];
-  snprintf(hist, sizeof(hist), "历史：%lu", static_cast<unsigned long>(g_highScore));
-  const int histW = g_u8g2.getUTF8Width(hist);
-  const int histX = 126 - histW;
-  g_u8g2.drawUTF8(histX, 12, hist);
-
-  if (!g_gameOver) {
-    char lvTxt[12];
-    snprintf(lvTxt, sizeof(lvTxt), "%u级", static_cast<unsigned>(g_speedLevel));
-    const int lvW = g_u8g2.getUTF8Width(lvTxt);
-    int lvX = (128 - lvW) / 2;
-    const int minLvX = 2 + wScoreLbl + 4;
-    const int maxLvX = histX - lvW - 4;
-    if (lvX < minLvX) {
-      lvX = minLvX;
-    }
-    if (lvX > maxLvX) {
-      lvX = maxLvX;
-    }
-    if (lvX <= maxLvX) {
-      g_u8g2.drawUTF8(lvX, 12, lvTxt);
-    }
+    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 56, "按游戏键开始");
   }
 }
 
@@ -792,9 +752,9 @@ static void drawBigScoreCentered(const char *asciiScore, const int baselineY) {
 static void drawPlayingHudExtras(const uint32_t now) {
   // 细进度条：距下次升级（满级时条内呼吸）
   constexpr int kBarX = 2;
-  constexpr int kBarY = 43;
+  constexpr int kBarY = 56;
   constexpr int kBarW = 124;
-  constexpr int kBarH = 4;
+  constexpr int kBarH = 5;
   int innerFill = 0;
   if (g_speedLevel >= kMaxDifficulty) {
     innerFill = ((now / 240) & 1U) != 0 ? (kBarW - 4) : (kBarW - 24);
@@ -815,17 +775,11 @@ static void drawPlayingHudExtras(const uint32_t now) {
 }
 
 static void drawOled(const uint32_t now) {
-  const bool chaseBorderDot =
-      ((g_screen == GameScreen::Playing || g_screen == GameScreen::StartFlash) && !g_gameOver);
   uint32_t minPeriod = 80u;
   if (g_screen == GameScreen::Splash) {
     minPeriod = 40u;
-  } else if (g_gameOver) {
-    minPeriod = 50u;
   } else if (hasActiveExplosion()) {
     minPeriod = 120u;
-  } else if (chaseBorderDot) {
-    minPeriod = 50u;
   }
   if ((now - g_lastDrawMs) < minPeriod) {
     return;
@@ -841,21 +795,22 @@ static void drawOled(const uint32_t now) {
     return;
   }
 
-  // 失败态：整屏每秒闪烁（亮 0.5s / 灭 0.5s），不再显示「游戏结束」
-  if (g_gameOver && ((now / 500) & 1U) != 0U) {
-    g_u8g2.sendBuffer();
-    return;
+  const bool inverted = g_gameOver;
+  if (inverted) {
+    g_u8g2.setDrawColor(1);
+    g_u8g2.drawBox(0, 0, 128, 64);
+    g_u8g2.setDrawColor(0);
   }
 
-  drawTopHudBar();
+  drawTopStatusBar(!g_gameOver, true);
 
   char buf[16];
   snprintf(buf, sizeof(buf), "%lu", static_cast<unsigned long>(g_score));
 
   if (g_gameOver) {
-    drawBigScoreCentered(buf, 44);
+    drawBigScoreCentered(buf, 40);
     g_u8g2.setFont(u8g2_font_wqy12_t_gb2312a);
-    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 60, "长按游戏键重开");
+    drawUtf8Centered(u8g2_font_wqy12_t_gb2312a, 62, "长按游戏键重开");
   } else if (g_screen == GameScreen::StartFlash) {
     g_u8g2.setFont(u8g2_font_wqy16_t_gb2312a);
     drawUtf8Centered(u8g2_font_wqy16_t_gb2312a, 38, "准备");
@@ -864,9 +819,7 @@ static void drawOled(const uint32_t now) {
       drawPlayingHudExtras(now);
     }
     drawBigScoreCentered(buf, 44);
-    drawBottomFourKeyHints();
   }
-  drawOledOuterFrameAndDot(now, chaseBorderDot);
   g_u8g2.sendBuffer();
 }
 
@@ -878,6 +831,11 @@ void setup() {
   pinMode(PIN_BTN_GREEN, INPUT_PULLUP);
   pinMode(PIN_BTN_BLUE, INPUT_PULLUP);
   pinMode(PIN_BTN_GAME, INPUT_PULLUP);
+  pinMode(PIN_BAT_ADC, INPUT);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  g_batSampleMs = 0;
+  sampleBattery(millis());
 
   initDebounced(g_dRed);
   initDebounced(g_dGreen);
@@ -938,6 +896,7 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
+  sampleBattery(now);
   handleFireButtons(now);
   wifiPortalLoop();
   handleGameButton(now);

@@ -1,0 +1,14 @@
+{
+  "platformio-ide.autoRebuildAutocompleteIndex": true,
+  "emeraldwalk.runonsave": {
+    "commands": [
+      {
+        "match": "\\.(cpp|h|ini)$",
+        "cmd": "pio run -t upload",
+        "isAsync": true,
+        "cancelIfNew": true,
+        "matchCase": false
+      }
+    ]
+  }
+}
